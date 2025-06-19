@@ -122,8 +122,13 @@ class UserController
             header('Location: /webbanhang/User');
             exit;
         }
+          // Ngăn không cho khóa tài khoản admin
+        if (!isset($user['role'])) {
+            SessionHelper::setFlash('error', 'Lỗi: Không thể xác định vai trò người dùng');
+            header('Location: /webbanhang/User');
+            exit;
+        }
         
-        // Ngăn không cho khóa tài khoản admin
         if ($user['role'] == 'admin') {
             SessionHelper::setFlash('error', 'Không thể tạm khóa tài khoản admin');
             header('Location: /webbanhang/User');

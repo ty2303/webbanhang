@@ -22,9 +22,8 @@ CREATE TABLE users (
     email VARCHAR(255) NOT NULL UNIQUE,
     password VARCHAR(255) NOT NULL, 
     avatar VARCHAR(255) DEFAULT NULL,
-    age INT DEFAULT NULL,
-    role ENUM('admin', 'staff', 'customer') NOT NULL DEFAULT 'customer',
-    status ENUM('pending', 'approved', 'rejected') NOT NULL DEFAULT 'approved',
+    age INT DEFAULT NULL,    role ENUM('admin', 'staff', 'customer') NOT NULL DEFAULT 'customer',
+    status ENUM('pending', 'approved', 'rejected', 'suspended') NOT NULL DEFAULT 'approved',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP 
 );
 

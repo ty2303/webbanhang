@@ -92,11 +92,9 @@ class UserModel
         }
         
         return ["Tên đăng nhập hoặc mật khẩu không đúng"];
-    }
-
-    public function getUserById($id)
+    }    public function getUserById($id)
     {
-        $stmt = $this->conn->prepare("SELECT id, username, email, avatar, age, created_at FROM {$this->table} WHERE id = ? LIMIT 1");
+        $stmt = $this->conn->prepare("SELECT id, username, email, avatar, age, role, status, created_at FROM {$this->table} WHERE id = ? LIMIT 1");
         $stmt->execute([$id]);
         
         return $stmt->fetch(PDO::FETCH_ASSOC);

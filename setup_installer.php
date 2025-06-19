@@ -19,16 +19,51 @@ session_start();
 // Cấu hình
 $setup_file = __DIR__ . '/database/master_setup.sql';
 $config_file = __DIR__ . '/app/config/database.php';
+$required_dirs = [
+    __DIR__ . '/public/uploads',
+    __DIR__ . '/app/config',
+];
 
 // Kiểm tra setup đã hoàn thành chưa
-if (file_exists(__DIR__ . '/.setup_complete')) {
-    header('Location: /webbanhang/');
-    exit;
+if (file_exists(__DIR__ . '/.setup_complete') && !isset($_GET['force'])) {
+    die('Setup đã hoàn thành. Nếu bạn muốn cài đặt lại, hãy xóa file .setup_complete hoặc thêm ?force=1 vào URL.');
 }
 
 $errors = [];
 $success = false;
-$step = $_GET['step'] ?? 1;
+$step = isset($_GET['step']) ? (int)$_GET['step'] : 1;
+
+// Kiểm tra yêu cầu hệ thống
+function checkSystemRequirements() {
+    $requirements = [
+        'PHP Version >= 7.4' => version_compare(PHP_VERSION, '7.4.0', '>='),
+        'PDO Extension' => extension_loaded('pdo'),
+        'PDO MySQL Extension' => extension_loaded('pdo_mysql'),
+        'JSON Extension' => extension_loaded('json'),
+        'GD Extension' => extension_loaded('gd'),
+        'FileInfo Extension' => extension_loaded('fileinfo'),
+    ];
+    
+    $failed = array_filter($requirements, function($met) {
+        return !$met;
+    });
+    
+    return ['met' => empty($failed), 'requirements' => $requirements];
+}
+
+// Kiểm tra và tạo thư mục
+function createRequiredDirectories($dirs) {
+    foreach ($dirs as $dir) {
+        if (!file_exists($dir)) {
+            if (!@mkdir($dir, 0755, true)) {
+                return false;
+            }
+        } elseif (!is_writable($dir)) {
+            return false;
+        }
+    }
+    return true;
+}
 
 // Xử lý form
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -37,374 +72,219 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $db_user = $_POST['db_user'] ?? 'root';
     $db_pass = $_POST['db_pass'] ?? '';
     
-    try {
-        // Test kết nối database
-        $pdo = new PDO("mysql:host=$db_host", $db_user, $db_pass);
-        $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-        
-        // Đọc và thực thi file SQL
-        if (file_exists($setup_file)) {
-            $sql = file_get_contents($setup_file);
-            
-            // Thực thi từng câu lệnh
-            $statements = explode(';', $sql);
-            foreach ($statements as $statement) {
-                $statement = trim($statement);
-                if (!empty($statement) && $statement !== '--') {
-                    $pdo->exec($statement);
-                }
+    // Validate input
+    if (empty($db_host)) $errors[] = "Vui lòng nhập hostname database";
+    if (empty($db_name)) $errors[] = "Vui lòng nhập tên database";
+    if (empty($db_user)) $errors[] = "Vui lòng nhập username database";
+    
+    if (empty($errors)) {
+        try {
+            // Kiểm tra thư mục
+            if (!createRequiredDirectories($required_dirs)) {
+                throw new Exception("Không thể tạo thư mục cần thiết. Vui lòng kiểm tra quyền ghi.");
             }
             
-            // Tạo file config database
-            $config_content = "<?php
-class Database
-{
+            // Test kết nối database
+            $pdo = new PDO("mysql:host=$db_host", $db_user, $db_pass);
+            $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+            
+            // Đọc và thực thi file SQL
+            if (file_exists($setup_file)) {
+                $sql = file_get_contents($setup_file);
+                
+                // Thực thi từng câu lệnh
+                $statements = array_filter(
+                    array_map('trim', 
+                        explode(';', $sql)
+                    ),
+                    function($stmt) {
+                        return !empty($stmt) && strpos($stmt, '--') !== 0;
+                    }
+                );
+                
+                foreach ($statements as $statement) {
+                    try {
+                        $pdo->exec($statement);
+                    } catch (PDOException $e) {
+                        // Log lỗi nhưng tiếp tục nếu không phải lỗi nghiêm trọng
+                        error_log("SQL Error: " . $e->getMessage());
+                    }
+                }
+                
+                // Tạo file config database
+                $config_content = "<?php
+class Database {
     private \$host = '$db_host';
     private \$db_name = '$db_name';
     private \$username = '$db_user';
     private \$password = '$db_pass';
-    private \$conn;
+    public \$conn;
 
-    public function getConnection()
-    {
+    public function getConnection() {
         \$this->conn = null;
         try {
-            \$this->conn = new PDO(\"mysql:host=\" . \$this->host . \";dbname=\" . \$this->db_name . \";charset=utf8mb4\", \$this->username, \$this->password);
+            \$this->conn = new PDO(
+                \"mysql:host=\" . \$this->host . 
+                \";dbname=\" . \$this->db_name . 
+                \";charset=utf8mb4\", 
+                \$this->username, 
+                \$this->password
+            );
             \$this->conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-        } catch(PDOException \$e) {
-            echo \"Connection error: \" . \$e->getMessage();
+            \$this->conn->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+            \$this->conn->setAttribute(PDO::ATTR_EMULATE_PREPARES, false);
+        } catch(PDOException \$exception) {
+            echo \"Connection error: \" . \$exception->getMessage();
         }
         return \$this->conn;
     }
-}
-?>";
-            
-            // Tạo thư mục config nếu chưa có
-            if (!file_exists(dirname($config_file))) {
-                mkdir(dirname($config_file), 0755, true);
+}";
+                
+                file_put_contents($config_file, $config_content);
+                
+                // Đánh dấu setup hoàn thành
+                file_put_contents(__DIR__ . '/.setup_complete', json_encode([
+                    'timestamp' => date('Y-m-d H:i:s'),
+                    'version' => '1.0.0',
+                    'database' => $db_name,
+                    'php_version' => PHP_VERSION
+                ]));
+                
+                $success = true;
+                
+            } else {
+                throw new Exception("Không tìm thấy file setup SQL");
             }
             
-            file_put_contents($config_file, $config_content);
-            
-            // Tạo thư mục uploads nếu chưa có
-            $upload_dir = __DIR__ . '/public/uploads';
-            if (!file_exists($upload_dir)) {
-                mkdir($upload_dir, 0755, true);
-            }
-            
-            // Đánh dấu setup hoàn thành
-            file_put_contents(__DIR__ . '/.setup_complete', date('Y-m-d H:i:s'));
-            
-            $success = true;
-            
-        } else {
-            $errors[] = "Không tìm thấy file setup SQL: $setup_file";
+        } catch (Exception $e) {
+            $errors[] = "Lỗi: " . $e->getMessage();
         }
-        
-    } catch (PDOException $e) {
-        $errors[] = "Lỗi database: " . $e->getMessage();
-    } catch (Exception $e) {
-        $errors[] = "Lỗi: " . $e->getMessage();
     }
 }
-?>
 
+// Kiểm tra yêu cầu hệ thống
+$system_check = checkSystemRequirements();
+
+?>
 <!DOCTYPE html>
 <html lang="vi">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Setup TITI Shop - Cài đặt hệ thống</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css">
+    <title>TITI Shop - Cài đặt hệ thống</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
-        body {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-        }
+        body { background: #f8f9fa; }
         .setup-container {
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 30px;
             background: white;
-            border-radius: 15px;
-            box-shadow: 0 15px 35px rgba(50, 50, 93, 0.1);
-            padding: 2rem;
-            margin: 2rem auto;
-            max-width: 600px;
+            border-radius: 10px;
+            box-shadow: 0 0 20px rgba(0,0,0,0.1);
         }
-        .setup-header {
-            text-align: center;
-            margin-bottom: 2rem;
-            padding-bottom: 1rem;
+        .requirement-item {
+            padding: 10px;
             border-bottom: 1px solid #eee;
         }
-        .setup-logo {
-            margin-bottom: 1rem;
-        }
-        .step-indicator {
-            display: flex;
-            justify-content: center;
-            margin-bottom: 2rem;
-        }
-        .step {
-            width: 40px;
-            height: 40px;
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            margin: 0 10px;
-            font-weight: bold;
-        }
-        .step.active {
-            background: #667eea;
-            color: white;
-        }
-        .step.completed {
-            background: #28a745;
-            color: white;
-        }
-        .step.pending {
-            background: #e9ecef;
-            color: #6c757d;
-        }
-        .feature-list {
-            background: #f8f9fa;
-            border-radius: 10px;
-            padding: 1.5rem;
-            margin-bottom: 2rem;
-        }
-        .feature-item {
-            display: flex;
-            align-items: center;
-            margin-bottom: 0.5rem;
-        }
-        .feature-item i {
-            color: #28a745;
-            margin-right: 10px;
+        .requirement-item:last-child {
+            border-bottom: none;
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="setup-container">
-            <div class="setup-header">
-                <div class="setup-logo">
-                    <h1><i class="bi bi-shop text-primary"></i> TITI Shop</h1>
-                </div>
-                <h2>Cài đặt hệ thống</h2>
-                <p class="text-muted">Thiết lập database và cấu hình ban đầu</p>
-            </div>            <?php if ($success): ?>
-                <!-- Step 3: Success -->
-                <div class="step-indicator">
-                    <div class="step completed">1</div>
-                    <div class="step completed">2</div>
-                    <div class="step active">3</div>
-                </div>
+    <div class="setup-container">
+        <h1 class="text-center mb-4">TITI Shop - Cài đặt hệ thống</h1>
+        
+        <?php if (!empty($errors)): ?>
+            <div class="alert alert-danger">
+                <ul class="mb-0">
+                    <?php foreach ($errors as $error): ?>
+                        <li><?php echo htmlspecialchars($error); ?></li>
+                    <?php endforeach; ?>
+                </ul>
+            </div>
+        <?php endif; ?>
 
-                <div class="alert alert-success text-center">
-                    <h4><i class="bi bi-check-circle"></i> Cài đặt thành công!</h4>
-                    <p>Hệ thống TITI Shop đã được cài đặt hoàn chỉnh.</p>
-                </div>
-
-                <div class="feature-list">
-                    <h5><i class="bi bi-info-circle"></i> Thông tin tài khoản Admin:</h5>
-                    <div class="row">
-                        <div class="col-md-6">
-                            <strong>Username:</strong> admin
-                        </div>
-                        <div class="col-md-6">
-                            <strong>Password:</strong> admin123
-                        </div>
+        <?php if ($success): ?>
+            <div class="alert alert-success">
+                <h4 class="alert-heading">Cài đặt thành công!</h4>
+                <p>Hệ thống đã được cài đặt thành công. Bạn có thể:</p>
+                <hr>
+                <p class="mb-0">
+                    <a href="/webbanhang/" class="btn btn-primary">Truy cập trang chủ</a>
+                    <a href="/webbanhang/tkadmin.php" class="btn btn-secondary">Đăng nhập Admin</a>
+                </p>
+                <hr>
+                <h5>Thông tin đăng nhập mặc định:</h5>
+                <ul>
+                    <li>Admin: admin / admin123</li>
+                    <li>Staff: Staff1 / Staff@123</li>
+                    <li>Customer: Customer1 / Customer@123</li>
+                </ul>
+            </div>
+        <?php else: ?>
+            <?php if ($step === 1): ?>
+                <div class="card mb-4">
+                    <div class="card-header">
+                        <h5 class="mb-0">Kiểm tra yêu cầu hệ thống</h5>
                     </div>
-                </div>                <div class="feature-list">
-                    <h5><i class="bi bi-list-check"></i> Tính năng đã cài đặt:</h5>
-                    <div class="feature-item">
-                        <i class="bi bi-check"></i>
-                        <span>Hệ thống người dùng với 3 vai trò: Admin, Staff, Customer</span>
-                    </div>
-                    <div class="feature-item">
-                        <i class="bi bi-check"></i>
-                        <span>Quản lý sản phẩm và danh mục</span>
-                    </div>
-                    <div class="feature-item">
-                        <i class="bi bi-check"></i>
-                        <span>Hệ thống giỏ hàng và đặt hàng với UI đã nâng cấp</span>
-                    </div>
-                    <div class="feature-item">
-                        <i class="bi bi-check"></i>
-                        <span>Hệ thống voucher/mã giảm giá hoàn chỉnh</span>
-                    </div>
-                    <div class="feature-item">
-                        <i class="bi bi-check"></i>
-                        <span>Quản lý trạng thái đơn hàng chi tiết</span>
-                    </div>
-                    <div class="feature-item">
-                        <i class="bi bi-check"></i>
-                        <span>Báo cáo doanh thu và thống kê</span>
-                    </div>
-                    <div class="feature-item">
-                        <i class="bi bi-check"></i>
-                        <span>Hệ thống duyệt tài khoản Staff</span>
-                    </div>
-                    <div class="feature-item">
-                        <i class="bi bi-check"></i>
-                        <span>Dữ liệu mẫu: 23 sản phẩm công nghệ + 5 vouchers</span>
-                    </div>
-                    <div class="feature-item">
-                        <i class="bi bi-check"></i>
-                        <span>Phân quyền hiển thị nút theo vai trò người dùng</span>
-                    </div>
-                </div>
-
-                <div class="feature-list">
-                    <h5><i class="bi bi-gift"></i> Vouchers có sẵn:</h5>
-                    <div class="row">
-                        <div class="col-md-6">
-                            <div class="feature-item">
-                                <i class="bi bi-tag"></i>
-                                <span><strong>WELCOME10</strong> - Giảm 10%</span>
+                    <div class="card-body">
+                        <?php foreach ($system_check['requirements'] as $requirement => $met): ?>
+                            <div class="requirement-item">
+                                <i class="fas fa-<?php echo $met ? 'check text-success' : 'times text-danger'; ?>"></i>
+                                <?php echo htmlspecialchars($requirement); ?>
+                                <?php if ($met): ?>
+                                    <span class="badge bg-success float-end">OK</span>
+                                <?php else: ?>
+                                    <span class="badge bg-danger float-end">Failed</span>
+                                <?php endif; ?>
                             </div>
-                            <div class="feature-item">
-                                <i class="bi bi-tag"></i>
-                                <span><strong>FREESHIP</strong> - Giảm 30k ship</span>
-                            </div>
-                            <div class="feature-item">
-                                <i class="bi bi-tag"></i>
-                                <span><strong>SUMMER20</strong> - Giảm 20%</span>
-                            </div>
-                        </div>
-                        <div class="col-md-6">
-                            <div class="feature-item">
-                                <i class="bi bi-tag"></i>
-                                <span><strong>NEWUSER50</strong> - Giảm 50k</span>
-                            </div>
-                            <div class="feature-item">
-                                <i class="bi bi-tag"></i>
-                                <span><strong>VIP15</strong> - Giảm 15% VIP</span>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="text-center">
-                    <a href="/webbanhang/" class="btn btn-primary btn-lg">
-                        <i class="bi bi-house"></i> Truy cập website
-                    </a>
-                </div>
-
-            <?php elseif ($step == 2 || !empty($errors)): ?>
-                <!-- Step 2: Database Config -->
-                <div class="step-indicator">
-                    <div class="step completed">1</div>
-                    <div class="step active">2</div>
-                    <div class="step pending">3</div>
-                </div>
-
-                <?php if (!empty($errors)): ?>
-                    <div class="alert alert-danger">
-                        <h6><i class="bi bi-exclamation-triangle"></i> Có lỗi xảy ra:</h6>
-                        <?php foreach($errors as $error): ?>
-                            <div>• <?php echo htmlspecialchars($error); ?></div>
                         <?php endforeach; ?>
+                        
+                        <?php if ($system_check['met']): ?>
+                            <div class="mt-3">
+                                <a href="?step=2" class="btn btn-primary">Tiếp tục cài đặt</a>
+                            </div>
+                        <?php else: ?>
+                            <div class="alert alert-warning mt-3">
+                                Vui lòng đảm bảo tất cả yêu cầu hệ thống được đáp ứng trước khi tiếp tục.
+                            </div>
+                        <?php endif; ?>
                     </div>
-                <?php endif; ?>
-
-                <form method="POST">
-                    <h5><i class="bi bi-database"></i> Cấu hình Database</h5>
-                    
+                </div>
+            <?php elseif ($step === 2): ?>
+                <form method="post" action="">
                     <div class="mb-3">
-                        <label for="db_host" class="form-label">Database Host</label>
-                        <input type="text" class="form-control" id="db_host" name="db_host" 
-                               value="<?php echo isset($_POST['db_host']) ? htmlspecialchars($_POST['db_host']) : 'localhost'; ?>" required>
-                    </div>
-                    
-                    <div class="mb-3">
-                        <label for="db_name" class="form-label">Database Name</label>
-                        <input type="text" class="form-control" id="db_name" name="db_name" 
-                               value="<?php echo isset($_POST['db_name']) ? htmlspecialchars($_POST['db_name']) : 'webbanhang'; ?>" required>
-                    </div>
-                    
-                    <div class="mb-3">
-                        <label for="db_user" class="form-label">Database User</label>
-                        <input type="text" class="form-control" id="db_user" name="db_user" 
-                               value="<?php echo isset($_POST['db_user']) ? htmlspecialchars($_POST['db_user']) : 'root'; ?>" required>
+                        <label for="db_host" class="form-label">Database Host:</label>
+                        <input type="text" class="form-control" id="db_host" name="db_host" value="localhost" required>
                     </div>
                     
                     <div class="mb-3">
-                        <label for="db_pass" class="form-label">Database Password</label>
-                        <input type="password" class="form-control" id="db_pass" name="db_pass" 
-                               value="<?php echo isset($_POST['db_pass']) ? htmlspecialchars($_POST['db_pass']) : ''; ?>">
-                        <div class="form-text">Để trống nếu không có password (XAMPP/LARAGON mặc định)</div>
-                    </div>
-
-                    <div class="alert alert-info">
-                        <i class="bi bi-info-circle"></i>
-                        <strong>Chú ý:</strong> Database <code><?php echo isset($_POST['db_name']) ? htmlspecialchars($_POST['db_name']) : 'webbanhang'; ?></code> sẽ được tạo mới hoặc ghi đè nếu đã tồn tại.
+                        <label for="db_name" class="form-label">Database Name:</label>
+                        <input type="text" class="form-control" id="db_name" name="db_name" value="webbanhang" required>
                     </div>
                     
-                    <div class="d-grid gap-2">
-                        <button type="submit" class="btn btn-success btn-lg">
-                            <i class="bi bi-download"></i> Cài đặt Database
-                        </button>
-                        <a href="?step=1" class="btn btn-outline-secondary">
-                            <i class="bi bi-arrow-left"></i> Quay lại
-                        </a>
+                    <div class="mb-3">
+                        <label for="db_user" class="form-label">Database Username:</label>
+                        <input type="text" class="form-control" id="db_user" name="db_user" value="root" required>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="db_pass" class="form-label">Database Password:</label>
+                        <input type="password" class="form-control" id="db_pass" name="db_pass">
+                    </div>
+                    
+                    <div class="mb-3">
+                        <a href="?step=1" class="btn btn-secondary">Quay lại</a>
+                        <button type="submit" class="btn btn-primary">Cài đặt</button>
                     </div>
                 </form>
-
-            <?php else: ?>
-                <!-- Step 1: Introduction -->
-                <div class="step-indicator">
-                    <div class="step active">1</div>
-                    <div class="step pending">2</div>
-                    <div class="step pending">3</div>
-                </div>                <div class="feature-list">
-                    <h5><i class="bi bi-info-circle"></i> Hệ thống sẽ cài đặt:</h5>
-                    <div class="feature-item">
-                        <i class="bi bi-check"></i>
-                        <span><strong>Database hoàn chỉnh</strong> - Tất cả bảng và dữ liệu mẫu</span>
-                    </div>
-                    <div class="feature-item">
-                        <i class="bi bi-check"></i>
-                        <span><strong>Hệ thống vai trò</strong> - Admin, Staff, Customer với phân quyền UI</span>
-                    </div>
-                    <div class="feature-item">
-                        <i class="bi bi-check"></i>
-                        <span><strong>Tài khoản Admin</strong> - Username: admin, Password: admin123</span>
-                    </div>
-                    <div class="feature-item">
-                        <i class="bi bi-check"></i>
-                        <span><strong>Dữ liệu mẫu</strong> - 23 sản phẩm + 5 vouchers + đơn hàng test</span>
-                    </div>
-                    <div class="feature-item">
-                        <i class="bi bi-check"></i>
-                        <span><strong>UI nâng cấp</strong> - Gradient design, hover effects, responsive</span>
-                    </div>
-                    <div class="feature-item">
-                        <i class="bi bi-check"></i>
-                        <span><strong>Voucher system</strong> - Mã giảm giá với nhiều loại chiết khấu</span>
-                    </div>
-                    <div class="feature-item">
-                        <i class="bi bi-check"></i>
-                        <span><strong>Order management</strong> - Theo dõi trạng thái chi tiết</span>
-                    </div>
-                    <div class="feature-item">
-                        <i class="bi bi-check"></i>
-                        <span><strong>Cấu hình tự động</strong> - Database config</span>
-                    </div>
-                </div>
-
-                <div class="alert alert-warning">
-                    <i class="bi bi-exclamation-triangle"></i>
-                    <strong>Lưu ý:</strong> Quá trình này sẽ tạo database mới và xóa dữ liệu cũ (nếu có).
-                </div>                <div class="text-center">
-                    <a href="?step=2" class="btn btn-primary btn-lg">
-                        <i class="bi bi-arrow-right"></i> Tiếp tục
-                    </a>
-                </div>
             <?php endif; ?>
-        </div>
+        <?php endif; ?>
     </div>
 
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://kit.fontawesome.com/a076d05399.js"></script>
 </body>
 </html>
